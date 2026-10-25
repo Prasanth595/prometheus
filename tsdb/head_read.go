@@ -667,6 +667,17 @@ func (h *Head) chunkFromSeries(s *memSeries, cid chunks.HeadChunkID, isOOO bool,
 		}
 	}
 
+	// With no appender incomplete at the snapshot, every later in-order sample
+	// has an ID above maxAppendID. txRing records IDs in append order, so its tail
+	// detects whether this series has received a newer sample. The series lock
+	// remains held through this check and any open-chunk copy, so later appends
+	// cannot change the returned bytes.
+	if copyLastChunk && isoState != nil && !isoState.IsolationDisabled() && len(isoState.incompleteAppends) == 0 {
+		if lastAppendID, ok := s.txs.lastAppendID(); ok && lastAppendID <= isoState.maxAppendID {
+			isoState = nil
+		}
+	}
+
 	return &safeHeadChunk{
 		Chunk:    chk,
 		s:        s,
@@ -770,15 +781,29 @@ type safeHeadChunk struct {
 }
 
 func (c *safeHeadChunk) Iterator(reuseIter chunkenc.Iterator) chunkenc.Iterator {
-	c.s.Lock()
-	it := c.s.iterator(c.cid, c.Chunk, c.isoState, reuseIter)
-	c.s.Unlock()
+	it, _ := c.iterator(reuseIter)
 	return it
 }
 
-// iterator returns a chunk iterator for the requested chunk ID, or a NopIterator if it is out of range.
+// The isolation-filtered iterator for a copied chunk also reports whether it hides samples.
+// The chunk bytes are stable at this point: open chunks were copied, and closed or mmapped chunks cannot be appended to.
+func (c *safeHeadChunk) iteratorForChunkCopy(reuseIter chunkenc.Iterator) (chunkenc.Iterator, bool) {
+	if c.isoState == nil || c.isoState.IsolationDisabled() {
+		return nil, false
+	}
+	return c.iterator(reuseIter)
+}
+
+func (c *safeHeadChunk) iterator(reuseIter chunkenc.Iterator) (chunkenc.Iterator, bool) {
+	c.s.Lock()
+	it, filtersSamples := c.s.iterator(c.cid, c.Chunk, c.isoState, reuseIter)
+	c.s.Unlock()
+	return it, filtersSamples
+}
+
+// The iterator for the requested chunk ID also reports whether it filters any samples.
 // It is unsafe to call this concurrently with s.append(...) without holding the series lock.
-func (s *memSeries) iterator(id chunks.HeadChunkID, c chunkenc.Chunk, isoState *isolationState, it chunkenc.Iterator) chunkenc.Iterator {
+func (s *memSeries) iterator(id chunks.HeadChunkID, c chunkenc.Chunk, isoState *isolationState, it chunkenc.Iterator) (chunkenc.Iterator, bool) {
 	ix := int(wrapChunkID(id - s.firstChunkID))
 
 	numSamples := c.NumSamples()
@@ -834,12 +859,12 @@ func (s *memSeries) iterator(id chunks.HeadChunkID, c chunkenc.Chunk, isoState *
 	}
 
 	if stopAfter == 0 {
-		return chunkenc.NewNopIterator()
+		return chunkenc.NewNopIterator(), numSamples > 0
 	}
 	if stopAfter == numSamples {
-		return c.Iterator(it)
+		return c.Iterator(it), false
 	}
-	return makeStopIterator(c, it, stopAfter)
+	return makeStopIterator(c, it, stopAfter), stopAfter < numSamples
 }
 
 // stopIterator wraps an Iterator, but only returns the first
